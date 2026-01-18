@@ -1,0 +1,71 @@
+# Environment variables
+.env
+
+# Output directories
+output/
+runs/
+eval_runs/
+craftium_runs/runs/
+craftium_runs/eval_runs/
+eval_videos/
+videos/
+
+# Evaluation results
+eval_results_*.json
+
+# Minetest runtime directories
+minetest-run-*/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# CMake and build artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+debug.txt
+run-logs/
+
+# Model checkpoints and agents
+*.pt
+*.pth
+*.ckpt
+agents/
+
+# Cache
+cache/
+.cache/
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
