@@ -402,6 +402,7 @@ def evaluate(
     print(f"[Eval] Environment: {env_id}")
     print(f"[Eval] Episodes: {num_episodes}")
     print(f"[Eval] Deterministic: {deterministic}")
+    print(f"[Eval] Seed: {seed}")
 
     larm = None
     if enable_armfm:
@@ -494,6 +495,7 @@ def evaluate(
         "env_id": env_id,
         "num_episodes": num_episodes,
         "deterministic": deterministic,
+        "seed": seed,
         "frameskip": frameskip,
         "episode_rewards": episode_rewards,
         "episode_lengths": episode_lengths,
@@ -558,6 +560,13 @@ def main():
                         help="Path to armfm_artifacts directory (contains rm_spec.txt, labeling_code.py, state_instructions.json)")
     parser.add_argument("--rm-reward-scale", type=float, default=0.0,
                         help="RM reward scale used in ARMFMEnvWrapper during eval")
+    parser.add_argument(
+        "--seed_num",
+        type=int,
+        default=1,
+        choices=[1, 2, 3],
+        help="Number of fixed seeds to evaluate (1...3). Uses [42, 123, 456] in order.",
+    )
 
     args = parser.parse_args()
 
@@ -569,24 +578,70 @@ def main():
     os.makedirs(args.video_dir, exist_ok=True)
     os.makedirs(args.mt_wd, exist_ok=True)
 
-    results = evaluate(
-        agent_path=args.agent_path,
-        env_id=args.env_id,
-        num_episodes=args.num_episodes,
-        deterministic=args.deterministic,
-        record_video=not args.no_video,
-        video_dir=args.video_dir,
-        mt_wd=args.mt_wd,
-        mt_port=args.mt_port,
-        frameskip=args.frameskip,
-        seed=args.seed,
-        z_dim=args.z_dim,
-        z_project_dim=args.z_project_dim,
-        device=args.device,
-        enable_armfm=args.enable_armfm,
-        armfm_artifacts_dir=args.armfm_artifacts_dir,
-        rm_reward_scale=args.rm_reward_scale,
+    FIXED_SEEDS = [42, 123, 456]
+    eval_seeds = FIXED_SEEDS[: args.seed_num]
+
+    all_results = []
+    for i, s in enumerate(eval_seeds, start=1):
+        print("\n" + "#" * 70)
+        print(f"[Multi-Seed Eval] {i}/{len(eval_seeds)}  seed={s}")
+        print("#" * 70)
+
+        # seedごとに動画ディレクトリを分ける（衝突回避）
+        per_seed_video_dir = args.video_dir
+        if not args.no_video:
+            per_seed_video_dir = os.path.join(args.video_dir, f"seed{s}")
+            os.makedirs(per_seed_video_dir, exist_ok=True)
+
+        res = evaluate(
+            agent_path=args.agent_path,
+            env_id=args.env_id,
+            num_episodes=args.num_episodes,
+            deterministic=args.deterministic,
+            record_video=not args.no_video,
+            video_dir=per_seed_video_dir,
+            mt_wd=args.mt_wd,
+            mt_port=args.mt_port,
+            frameskip=args.frameskip,
+            seed=s,
+            z_dim=args.z_dim,
+            z_project_dim=args.z_project_dim,
+            device=args.device,
+            enable_armfm=args.enable_armfm,
+            armfm_artifacts_dir=args.armfm_artifacts_dir,
+            rm_reward_scale=args.rm_reward_scale,
+        )
+        all_results.append(res)
+
+    # 集計（seed間の平均）
+    mean_rewards = [r["mean_reward"] for r in all_results]
+    mean_lengths = [r["mean_length"] for r in all_results]
+    mean_chops = [r["mean_chops"] for r in all_results]
+
+    agg = {
+        "seed_num": args.seed_num,
+        "seeds": eval_seeds,
+        "mean_reward_over_seeds": float(np.mean(mean_rewards)),
+        "std_reward_over_seeds": float(np.std(mean_rewards)),
+        "mean_length_over_seeds": float(np.mean(mean_lengths)),
+        "std_length_over_seeds": float(np.std(mean_lengths)),
+        "mean_chops_over_seeds": float(np.mean(mean_chops)),
+        "std_chops_over_seeds": float(np.std(mean_chops)),
+    }
+
+    print("\n" + "=" * 60)
+    print("Multi-Seed Summary")
+    print("=" * 60)
+    for r in all_results:
+        print(
+            f"  seed={r['seed']}: mean_reward={r['mean_reward']:.2f}, mean_length={r['mean_length']:.0f}, mean_chops={r['mean_chops']:.2f}"
+        )
+    print("-" * 60)
+    print(
+        f"  over_seeds: mean_reward={agg['mean_reward_over_seeds']:.2f} ± {agg['std_reward_over_seeds']:.2f}"
     )
+    print("=" * 60)
+
 
     # 結果をJSONに保存
     if args.output_json:
