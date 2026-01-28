@@ -1,0 +1,136 @@
+defaults:
+  - _self_
+
+# --------------------------
+# Experiment meta
+# --------------------------
+exp_name: exp_dreamer
+seed: 42
+torch_deterministic: true
+cuda: true
+
+# --------------------------
+# W&B
+# --------------------------
+track: true
+wandb_project_name: craftium-dreamer
+wandb_entity: null
+wandb_resume: true
+
+# --------------------------
+# Craftium / Env
+# --------------------------
+env_id: Craftium/ChopTree-v0
+capture_video: true
+async_envs: false
+mt_wd: "./"
+frameskip: 4
+mt_port: 49155
+obs_size: 84
+num_envs: 4
+time_limit: 0   # 0 disables wrapper-based time limit
+eval_episode_num: 0
+
+# --------------------------
+# Dreamer core
+# --------------------------
+steps: 1000000        # total environment steps (before dividing by action_repeat)
+eval_every: 10000
+log_every: 10000
+reset_every: 0
+device: cuda
+compile: false
+precision: 32
+debug: false
+video_pred_log: true
+action_repeat: ${frameskip}
+prefill: 5000
+dataset_size: 100000
+parallel: false
+deterministic_run: false
+reward_EMA: true
+
+# --------------------------
+# Model
+# --------------------------
+dyn_hidden: 512
+dyn_deter: 512
+dyn_stoch: 32
+dyn_discrete: 32
+dyn_rec_depth: 1
+dyn_mean_act: 'none'
+dyn_std_act: 'sigmoid2'
+dyn_min_std: 0.1
+grad_heads: ['decoder', 'reward', 'cont']
+units: 512
+act: 'SiLU'
+norm: true
+encoder: {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: true, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: true}
+decoder: {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: true, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: false, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
+actor: {layers: 2, dist: 'onehot', entropy: 3e-4, unimix_ratio: 0.01, std: 'none', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+critic: {layers: 2, dist: 'symlog_disc', slow_target: true, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+reward_head: {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+cont_head: {layers: 2, loss_scale: 1.0, outscale: 1.0}
+dyn_scale: 0.5
+rep_scale: 0.1
+kl_free: 1.0
+weight_decay: 0.0
+unimix_ratio: 0.01
+initial: 'learned'
+
+# --------------------------
+# Training
+# --------------------------
+batch_size: 16
+batch_length: 64
+train_ratio: 512
+pretrain: 100
+model_lr: 1e-4
+opt_eps: 1e-8
+grad_clip: 1000
+opt: 'adam'
+
+# --------------------------
+# Behavior
+# --------------------------
+discount: 0.997
+discount_lambda: 0.95
+imag_horizon: 15
+imag_gradient: 'dynamics'
+imag_gradient_mix: 0.0
+eval_state_mean: false
+
+# --------------------------
+# Exploration
+# --------------------------
+expl_behavior: 'greedy'
+expl_until: 0
+expl_extr_scale: 0.0
+expl_intr_scale: 1.0
+disag_target: 'stoch'
+disag_log: true
+disag_models: 10
+disag_offset: 1
+disag_layers: 4
+disag_units: 400
+disag_action_cond: false
+
+# --------------------------
+# Save / Resume
+# --------------------------
+save_agent: true
+save_num: 5
+save_checkpoint: true
+checkpoint_every: 1
+resume: false
+resume_path: ""
+resume_strict: false
+
+# --------------------------
+# Hydra output directory
+# --------------------------
+hydra:
+  job:
+    chdir: true
+  run:
+    dir: /home/jovyan/work/srv21/craftium_exp/output/exp_dreamer/${now:%Y-%m-%d_%H-%M-%S}

@@ -1,0 +1,102 @@
+defaults:
+  - _self_
+
+# --------------------------
+# Experiment meta
+# --------------------------
+exp_name: exp_armfmppo
+seed: 42
+torch_deterministic: true
+cuda: true
+
+# --------------------------
+# W&B (optional)
+# --------------------------
+track: false
+wandb_project_name: craftium-armfmppo
+wandb_entity: null
+
+# --------------------------
+# Env / Craftium runtime
+# --------------------------
+env:
+  env_id: Craftium/ChopTree-v0
+  async_envs: false
+  mt_wd: "./"           # Minetest run_dir_prefix
+  frameskip: 4
+  mt_port: 49155
+  fps_max: 200
+  pmul: 1.0
+  capture_video: false  # idx==0 の env のみ録画
+  mt_listen_timeout: 300000
+
+# --------------------------
+# PPO
+# --------------------------
+ppo:
+  total_timesteps: 1000000
+  learning_rate: 2.5e-4
+  num_envs: 4
+  num_steps: 128
+  anneal_lr: true
+  gamma: 0.99
+  gae_lambda: 0.95
+  num_minibatches: 4
+  update_epochs: 4
+  norm_adv: true
+  clip_coef: 0.1
+  clip_vloss: true
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  target_kl: null
+
+# --------------------------
+# Saving / logging
+# --------------------------
+save:
+  save_agent: true
+  save_num: 5
+  save_checkpoint: false
+
+log:
+  tensorboard: true
+  csv: true
+  flush_tb: true
+  log_interval: 1
+
+# --------------------------
+# ARM-FM (+ PPO)
+# --------------------------
+armfm:
+  enable: true
+  rm_reward_scale: 0.0
+  z_dim: 256
+  z_project_dim: 128
+
+  # LARM build behavior
+  auto_build_larm: true
+  larm_gen_rounds: 2
+  larm_max_retries: 3
+
+  mission_text: "密林にスポーンしたプレイヤーが鋼の斧で木を切る。木を切るたびに報酬 +1.0 を得るため、エピソード中にできるだけ多くの木を切る。"
+
+  # FM API (OpenAI互換の JSON API を想定)
+  fm_api_base: null
+  fm_api_key: null
+  fm_chat_model: null
+  fm_embed_model: null
+  fm_timeout_s: 60.0
+
+  # 既存の FM 出力（armfm_artifacts）を使う
+  # ここが空でなければ、LLM を呼ばずにこのディレクトリの成果物を読む
+  fm_output_dir: ""
+
+# --------------------------
+# Hydra output directory
+# --------------------------
+hydra:
+  job:
+    chdir: true
+  run:
+    dir: /home/jovyan/work/srv11/craftium_exp/output/exp_armfmppo/${now:%Y-%m-%d_%H-%M-%S}
