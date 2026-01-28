@@ -1,0 +1,13 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+torch
+gymnasium
+numpy
+hydra-core
+wandb
+tensorboard
+omegaconf
+opencv-python
+moviepy
+imageio
+imageio-ffmpeg
