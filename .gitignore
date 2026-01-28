@@ -2,7 +2,8 @@
 .env
 
 # Output directories
-output/
+output/*
+!output/.gitkeep
 runs/
 eval_runs/
 craftium_runs/runs/
