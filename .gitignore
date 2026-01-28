@@ -1,49 +1,48 @@
-# Environment variables
-.env
-
-# Output directories
+# Outputs
 output/*
 !output/.gitkeep
+*.log
+*.ckpt
+*.pth
+*.pt
+checkpoints/
+wandb/
 runs/
-eval_runs/
-craftium_runs/runs/
-craftium_runs/eval_runs/
-eval_videos/
-videos/
-
-# Evaluation results
-eval_results_*.json
-
-# Minetest runtime directories
-minetest-run-*/
 
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-*.egg
-*.egg-info/
-dist/
-build/
-*.whl
 .Python
-.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
 venv/
-ENV/
 env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
 
-# CMake and build artifacts
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
-CPackConfig.cmake
-CPackSourceConfig.cmake
-Makefile
-*.cmake
-!CMakeLists.txt
-
-# IDE and editors
+# IDE
 .vscode/
 .idea/
 *.swp
@@ -51,22 +50,24 @@ Makefile
 *~
 .DS_Store
 
-# Logs
-*.log
-debug.txt
-run-logs/
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
 
-# Model checkpoints and agents
-*.pt
-*.pth
-*.ckpt
-agents/
+# Data
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.npy
+*.npz
 
-# Cache
-cache/
-.cache/
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
 
-# Temporary files
-*.tmp
-*.bak
-*.backup
+# Environment variables
+.env
+.env.local
