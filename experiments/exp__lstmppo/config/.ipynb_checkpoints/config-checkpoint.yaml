@@ -1,0 +1,74 @@
+defaults:
+  - _self_
+
+# --------------------------
+# Experiment meta
+# --------------------------
+exp_name: exp_lstmppo
+seed: 42
+torch_deterministic: true
+cuda: true
+
+# --------------------------
+# W&B
+# --------------------------
+track: true
+wandb_project_name: craftium-ppo-lstm
+wandb_entity: null
+
+# --------------------------
+# Craftium / Env
+# --------------------------
+env_id: Craftium/ChopTree-v0
+
+capture_video: true
+async_envs: false
+mt_wd: "./"          # Minetest working dir prefix
+frameskip: 4
+mt_port: 49155
+
+# --------------------------
+# PPO(LSTM)
+# --------------------------
+total_timesteps: 1000000
+learning_rate: 2.5e-4
+num_envs: 4
+num_steps: 128
+anneal_lr: true
+gamma: 0.99
+gae_lambda: 0.95
+num_minibatches: 4
+update_epochs: 4
+norm_adv: true
+clip_coef: 0.1
+clip_vloss: true
+ent_coef: 0.01
+vf_coef: 0.5
+max_grad_norm: 0.5
+target_kl: null
+
+# --------------------------
+# Save
+# --------------------------
+save_agent: true
+save_num: 5
+
+# --------------------------
+# Checkpoint / Resume
+# --------------------------
+resume: false
+resume_path: ""          # 例: "checkpoints/latest.pt" または 過去runの絶対パス
+save_checkpoint: true
+checkpoint_every: 10      # iterationごと。1なら毎iteration保存
+wandb_resume: true       # checkpointからW&B run_idを復元して同じRunへresumeする
+
+# --------------------------
+# Hydra output directory
+#   - 実行時刻でフォルダを切る
+#   - ここが "output/exp_lstmppo/<日時>" になる
+# --------------------------
+hydra:
+  job:
+    chdir: true
+  run:
+    dir: /home/jovyan/work/srv11/craftium_exp/output/exp_lstmppo/${now:%Y-%m-%d_%H-%M-%S}

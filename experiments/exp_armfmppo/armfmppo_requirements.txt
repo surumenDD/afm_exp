@@ -1,0 +1,12 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+numpy
+gymnasium
+torch
+hydra-core
+omegaconf
+requests
+python-dotenv
+tensorboard
+wandb
+craftium
