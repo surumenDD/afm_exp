@@ -1,100 +1,227 @@
 # -*- coding: utf-8 -*-
 """
-Craftium Dreamer 学習済みエージェントの評価スクリプト（単発seed）
-- exp_dreamer/train.py と同じ前処理・同じ Dreamer 構造で評価する
-- 複数エピソードを実行し、return / length / chops を集計する
-- 動画録画（RecordVideo）対応：全エピソード保存
-- agent_state_dict形式チェックポイント / state_dict単体 の両方を自動判別してロード
+Dreamer 学習済みエージェント評価 (Single-seed / Multi-seed)
 
-想定:
-  - このスクリプトは craftium_exp/experiments/exp_dreamer/ に置く
-  - craftium_exp/dreamerv3-torch が存在する
+主な機能:
+- checkpoint 内の `cfg` (Training時のHydra設定) を優先して読み込み、同一構造の Dreamer を再構築してロードします。
+- `cfg` が含まれない checkpoint の場合でも、形状が一致する重みのみをロードするフォールバック機能 (strict=False) を備えています。
 
-実行例:
-  - cd /home/jovyan/work/srv11/craftium_exp/experiments/exp_dreamer
-
-python single_seed_dreamer_evaluate.py \
-  --agent-path /home/jovyan/work/srv11/craftium_exp/output/exp_dreamer/2026-01-23_15-32-01/agents/agent_step_999424.pt \
-  --num-episodes 5 \
-  --seed 77 \
-  --frameskip 4 \
-  --obs-size 64 \
-  --mt-wd ./eval_runs \
-  --mt-port 49210 \
-  --device cuda \
-  --output-json ../output/dreamer_eval_seed77.json
-
+出力:
+- 各エピソードの `chops` 数 (報酬合計)
+- シード内の `chops` の最小/最大エピソード番号 (同率の場合は全て表示)
 """
 
+import envs.wrappers as dv3_wrappers  # type: ignore
+import dreamer as dv3  # type: ignore
 import os
 import sys
 import json
 import time
 import argparse
-import random
 import pathlib
-import functools
+import socket
 from types import SimpleNamespace
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
-import torch
 import gymnasium as gym
-from omegaconf import OmegaConf, DictConfig
+import torch
 
-import craftium  # noqa: F401
-
+import craftium
 
 # ---------------------------------------------------------------------------
-# Path setup for dreamerv3-torch modules (Hydra chdir でも壊れない)
+# Path setup for dreamerv3-torch modules
 # ---------------------------------------------------------------------------
 THIS_DIR = pathlib.Path(__file__).resolve().parent
-# exp_dreamer/ の親は experiments/、その親が craftium_exp/
-WORKSPACE_ROOT = THIS_DIR.parents[1] if len(THIS_DIR.parents) >= 2 else THIS_DIR
+WORKSPACE_ROOT = THIS_DIR.parents[1] if len(
+    THIS_DIR.parents) >= 4 else THIS_DIR
 DREAMER_ROOT = WORKSPACE_ROOT / "dreamerv3-torch"
 if str(DREAMER_ROOT) not in sys.path:
     sys.path.insert(0, str(DREAMER_ROOT))
 
-import dreamer as dv3  # type: ignore
-import tools  # type: ignore
-import envs.wrappers as wrappers  # type: ignore
-from parallel import Damy  # type: ignore
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def pick_free_tcp_port() -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = int(sock.getsockname()[1])
+    sock.close()
+    return port
+
+
+def as_int(x: Any, default: int) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return int(default)
+
+
+def as_bool(x: Any, default: bool) -> bool:
+    try:
+        return bool(x)
+    except Exception:
+        return bool(default)
+
+
+def extract_state_dict_and_cfg(loaded_obj: Any) -> Tuple[Dict[str, torch.Tensor], Optional[Dict[str, Any]]]:
+    """
+    返すもの:
+      - state_dict: model.load_state_dict に入れる辞書
+      - cfg_dict: 訓練時 Hydra cfg
+    """
+    if isinstance(loaded_obj, dict):
+        cfg_dict = loaded_obj.get("cfg", None)
+        if cfg_dict is not None and not isinstance(cfg_dict, dict):
+            cfg_dict = None
+
+        if "agent_state_dict" in loaded_obj and isinstance(loaded_obj["agent_state_dict"], dict):
+            return loaded_obj["agent_state_dict"], cfg_dict
+
+        # items_to_save 形式 (latest.pt 等): {"agent_state_dict":..., "optims_state_dict":...} は上で拾う
+        # それ以外: dict がそのまま state_dict である可能性
+        looks_like_state_dict = all(isinstance(k, str) and isinstance(
+            v, torch.Tensor) for k, v in loaded_obj.items())
+        if looks_like_state_dict:
+            return loaded_obj, cfg_dict
+
+    raise ValueError(
+        "checkpoint の形式を解釈できない（agent_state_dict も state_dict 形式でもない）")
+
+
+def make_dreamer_config_from_training_cfg(
+    training_cfg: Dict[str, Any],
+    device_str: str,
+    num_envs: int,
+    num_actions: int,
+    deterministic_eval: bool,
+) -> SimpleNamespace:
+    """
+    train.py の to_dreamer_config と同様のロジック:
+      - training_cfg をベースにし、Dreamer 初期化に必要なキーを補完します。
+    """
+    cfg = dict(training_cfg)
+
+    # device / shape
+    obs_size = as_int(cfg.get("obs_size", cfg.get("size", [84, 84])[
+                      0] if isinstance(cfg.get("size"), list) else 84), 84)
+    cfg.setdefault("device", device_str)
+    cfg.setdefault("size", [obs_size, obs_size])
+
+    # dirs (評価では実ファイル保存を必須にしない)
+    cfg.setdefault("logdir", "logs")
+    cfg.setdefault("traindir", None)
+    cfg.setdefault("evaldir", None)
+    cfg.setdefault("offline_traindir", "")
+    cfg.setdefault("offline_evaldir", "")
+
+    # envs / actions
+    cfg.setdefault("envs", int(num_envs))
+    cfg["num_actions"] = int(num_actions)
+
+    # 訓練 cfg の action_repeat を尊重する（env 側で frameskip 済みの運用があり得る）
+    if "action_repeat" in cfg:
+        cfg["action_repeat"] = as_int(cfg["action_repeat"], 1)
+    else:
+        cfg["action_repeat"] = 1
+
+    cfg.setdefault("time_limit", as_int(cfg.get("time_limit", 0), 0))
+
+    # 評価モードにおける決定性 (Deterministic Evaluation)
+    if deterministic_eval:
+        cfg["eval_state_mean"] = True
+
+    return SimpleNamespace(**cfg)
+
+
+def load_state_dict_no_crash(model: torch.nn.Module, state_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    """
+    まず strict=True を試す。
+    失敗したら shape が合うキーだけにフィルタして strict=False で落とさない。
+    """
+    try:
+        incompatible = model.load_state_dict(state_dict, strict=True)
+        return {
+            "mode": "strict",
+            "missing_keys": list(getattr(incompatible, "missing_keys", [])),
+            "unexpected_keys": list(getattr(incompatible, "unexpected_keys", [])),
+            "filtered_out": [],
+        }
+    except Exception as first_error:
+        model_sd = model.state_dict()
+        filtered: Dict[str, torch.Tensor] = {}
+        filtered_out = []
+        for key, value in state_dict.items():
+            if key not in model_sd:
+                filtered_out.append(key)
+                continue
+            if tuple(model_sd[key].shape) != tuple(value.shape):
+                filtered_out.append(key)
+                continue
+            filtered[key] = value
+        incompatible = model.load_state_dict(filtered, strict=False)
+        return {
+            "mode": "filtered",
+            "first_error": str(first_error),
+            "missing_keys": list(getattr(incompatible, "missing_keys", [])),
+            "unexpected_keys": list(getattr(incompatible, "unexpected_keys", [])),
+            "filtered_out": filtered_out,
+        }
 
 
 # ---------------------------------------------------------------------------
 # Gymnasium -> gym compatibility and Craftium dict observation wrapper
-# exp_dreamer/train.py と同等
 # ---------------------------------------------------------------------------
-def as_float_scalar(x) -> float:
-    a = np.asarray(x)
-    if a.ndim == 0:
-        return float(a)
-    if a.size == 1:
-        return float(a.reshape(()))
-    return float(a.sum())
+class OneHotActionCompat(gym.ActionWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        if not hasattr(env.action_space, "n"):
+            raise TypeError(
+                f"OneHotActionCompat expects Discrete-like action_space, got: {env.action_space}")
+        self._n = int(env.action_space.n)
+        self.action_space = gym.spaces.Box(
+            low=0.0, high=1.0, shape=(self._n,), dtype=np.float32)
+
+    def action(self, action):
+        if isinstance(action, dict):
+            if "action" in action:
+                action = action["action"]
+            else:
+                raise TypeError(
+                    f"Unsupported action dict keys: {list(action.keys())}")
+
+        if isinstance(action, (int, np.integer)):
+            return int(action)
+
+        if torch.is_tensor(action):
+            action = action.detach().cpu().numpy()
+
+        arr = np.asarray(action)
+
+        # shape=(1,) や (1,1) を「離散index」として扱う
+        if arr.ndim == 0 or arr.size == 1:
+            return int(arr.reshape(()))
+
+        # one-hot / logits (n,) または (1,n) は argmax
+        idx = np.argmax(arr, axis=-1)
+        if isinstance(idx, np.ndarray):
+            idx = idx.item()
+        return int(idx)
 
 
 class GymV26ToV21(gym.Wrapper):
-    """gymnasium (obs, reward, terminated, truncated, info) -> gym style (obs, reward, done, info)"""
-
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         done = bool(terminated or truncated)
         info = dict(info) if info is not None else {}
         info.setdefault("terminated", terminated)
         info.setdefault("truncated", truncated)
-        info.setdefault("discount", np.array(0.0 if terminated else 1.0, dtype=np.float32))
-
-        # ChopTree: episode total reward = chops（終了時の統計に入れる）
-        if done and isinstance(info.get("episode"), dict):
-            ep_r = info["episode"].get("r", None)
-            if ep_r is not None:
-                info["episode"]["chops"] = as_float_scalar(ep_r)
-
+        info.setdefault("discount", np.array(
+            0.0 if terminated else 1.0, dtype=np.float32))
         return obs, reward, done, info
 
     def reset(self, **kwargs):
-        # Gymnasium reset() -> (obs, info) を obs のみに潰す
         result = self.env.reset(**kwargs)
         if isinstance(result, tuple) and len(result) == 2:
             obs, _info = result
@@ -103,8 +230,6 @@ class GymV26ToV21(gym.Wrapper):
 
 
 class CraftiumObsDictWrapper(gym.Wrapper):
-    """image観測を Dreamer が期待する dict に変換する"""
-
     def __init__(self, env, obs_key: str = "image", channel_last: bool = True):
         super().__init__(env)
         self._obs_key = obs_key
@@ -112,15 +237,13 @@ class CraftiumObsDictWrapper(gym.Wrapper):
 
         raw_space = self.env.observation_space
         if not isinstance(raw_space, gym.spaces.Box):
-            raise ValueError("CraftiumObsDictWrapper expects Box observation space")
+            raise ValueError(
+                "CraftiumObsDictWrapper expects Box observation space")
 
         img_shape = raw_space.shape
-        # FrameStack(1) 後を想定： (C,H,W)
-        if len(img_shape) != 3:
-            raise ValueError(f"Expected (C,H,W) after FrameStack, got {img_shape}")
-
         if channel_last:
-            c, h, w = img_shape[0], img_shape[1], img_shape[2]
+            h, w = img_shape[1], img_shape[2]
+            c = img_shape[0]
             image_shape = (h, w, c)
         else:
             image_shape = img_shape
@@ -136,535 +259,609 @@ class CraftiumObsDictWrapper(gym.Wrapper):
     def _to_image(self, obs):
         arr = np.array(obs)
         if self._channel_last:
-            # (C,H,W) -> (H,W,C)
             arr = np.transpose(arr, (1, 2, 0))
         return arr.astype(np.uint8)
 
     def reset(self, **kwargs):
         obs = self.env.reset(**kwargs)
-        return {
-            self._obs_key: self._to_image(obs),
-            "is_first": True,
-            "is_terminal": False,
-        }
+        return {"image": self._to_image(obs), "is_first": True, "is_terminal": False}
 
     def step(self, action):
         obs, reward, done, info = self.env.step(action)
         terminated = bool(info.get("terminated", done))
-        obs_dict = {
-            self._obs_key: self._to_image(obs),
-            "is_first": False,
-            "is_terminal": terminated,
-        }
+        obs_dict = {"image": self._to_image(
+            obs), "is_first": False, "is_terminal": terminated}
         return obs_dict, reward, done, info
 
 
-class OneHotActionCompat(gym.ActionWrapper):
-    """Discrete -> onehot Box に見せる（Dreamerが onehot を期待する系の互換）"""
-
-    def __init__(self, env):
-        super().__init__(env)
-        if not hasattr(env.action_space, "n"):
-            raise TypeError(f"OneHotActionCompat expects Discrete-like action_space, got: {env.action_space}")
-        self._n = int(env.action_space.n)
-        self.action_space = gym.spaces.Box(low=0.0, high=1.0, shape=(self._n,), dtype=np.float32)
-
-    def action(self, action):
-        # Dreamerが dict を返すケース対応
-        if isinstance(action, dict):
-            if "action" in action:
-                action = action["action"]
-            else:
-                raise TypeError(f"Unsupported action dict keys: {list(action.keys())}")
-
-        # intならそのまま
-        if isinstance(action, (int, np.integer)):
-            return int(action)
-
-        # torch tensor / list / np.array を許容
-        if torch.is_tensor(action):
-            action = action.detach().cpu().numpy()
-
-        a = np.asarray(action)
-
-        # scalarならそのまま
-        if a.ndim == 0:
-            return int(a)
-
-        # (n,) one-hot / logits -> argmax
-        idx = np.argmax(a, axis=-1)
-        if isinstance(idx, np.ndarray):
-            idx = idx.item()
-        return int(idx)
-
-
 # ---------------------------------------------------------------------------
-# Config / checkpoint helpers
-# ---------------------------------------------------------------------------
-def _find_latest_pt_in_dir(dir_path: str) -> Optional[str]:
-    if not dir_path or (not os.path.isdir(dir_path)):
-        return None
-    pts = [f for f in os.listdir(dir_path) if f.endswith(".pt")]
-    if not pts:
-        return None
-    pts = sorted(pts)
-    return os.path.join(dir_path, pts[-1])
-
-
-def resolve_agent_path(agent_path: str) -> str:
-    p = str(agent_path).strip()
-    if os.path.isdir(p):
-        latest = _find_latest_pt_in_dir(p)
-        if latest is None:
-            raise FileNotFoundError(f"No .pt found in directory: {p}")
-        return latest
-    if os.path.isfile(p):
-        return p
-    raise FileNotFoundError(f"agent_path not found: {p}")
-
-
-def load_agent_payload(path: str, device: torch.device) -> Tuple[Dict[str, Any], DictConfig]:
-    """
-    戻り値:
-      payload: loadしたdict（state_dict単体 or checkpoint辞書）
-      cfg: DictConfig（あれば復元、なければ空）
-    """
-    obj = torch.load(path, map_location=device)
-
-    # checkpoint形式
-    if isinstance(obj, dict) and "agent_state_dict" in obj:
-        cfg_container = obj.get("cfg", None)
-        cfg = OmegaConf.create(cfg_container) if isinstance(cfg_container, (dict, list)) else OmegaConf.create({})
-        return obj, cfg
-
-    # state_dict単体
-    if isinstance(obj, dict):
-        return {"agent_state_dict": obj}, OmegaConf.create({})
-
-    raise ValueError(f"Unsupported checkpoint format: {type(obj)}")
-
-
-def find_hydra_config_yaml(agent_path: str) -> Optional[str]:
-    """
-    agents/agent_step_*.pt から親をたどって .hydra/config.yaml を探す
-    """
-    p = pathlib.Path(agent_path).resolve()
-    for parent in [p.parent] + list(p.parents):
-        cand = parent / ".hydra" / "config.yaml"
-        if cand.is_file():
-            return str(cand)
-    return None
-
-
-def merge_cfg(base_cfg: DictConfig, hydra_cfg: Optional[DictConfig]) -> DictConfig:
-    if hydra_cfg is None:
-        return base_cfg
-    # base_cfg に hydra_cfg を上書きマージ
-    merged = OmegaConf.merge(base_cfg, hydra_cfg)
-    return merged
-
-
-def default_cfg_dict() -> Dict[str, Any]:
-    # exp_dreamer/config/config.yaml の重要部分 + 評価に必要な最低限
-    return dict(
-        exp_name="exp_dreamer",
-        seed=42,
-        torch_deterministic=True,
-        cuda=True,
-        track=False,
-        wandb_project_name="craftium-dreamer",
-        wandb_entity=None,
-        wandb_resume=True,
-        env_id="Craftium/ChopTree-v0",
-        mt_wd="./eval_runs",
-        frameskip=4,
-        mt_port=49200,
-        obs_size=64,
-        num_envs=1,
-        time_limit=0,
-        precision=32,
-        # Dreamer core / model（学習時に合うように、上書き可能）
-        steps=1,
-        eval_every=1,
-        log_every=1,
-        reset_every=0,
-        device="cuda",
-        compile=False,
-        debug=False,
-        video_pred_log=False,
-        action_repeat=1,
-        prefill=0,
-        dataset_size=1000,
-        parallel=False,
-        deterministic_run=False,
-        reward_EMA=True,
-        dyn_hidden=128,
-        dyn_deter=128,
-        units=128,
-        encoder=dict(cnn_depth=8),
-        decoder=dict(cnn_depth=8),
-        actor=dict(layers=1),
-        critic=dict(layers=1),
-        batch_size=16,
-        batch_length=32,
-        train_ratio=32,
-        pretrain=0,
-    )
-
-
-def to_dreamer_config(cfg: DictConfig, device_str: str, logdir: pathlib.Path) -> SimpleNamespace:
-    container = OmegaConf.to_container(cfg, resolve=True)
-    container = dict(container)
-
-    # 必須に寄せる（train.py と同じ思想）
-    container.setdefault("device", device_str)
-    container.setdefault("size", [int(cfg.obs_size), int(cfg.obs_size)])
-    container.setdefault("logdir", str(logdir))
-    container.setdefault("traindir", None)
-    container.setdefault("evaldir", None)
-    container.setdefault("offline_traindir", "")
-    container.setdefault("offline_evaldir", "")
-    container.setdefault("envs", int(cfg.num_envs))
-    container.setdefault("action_repeat", int(getattr(cfg, "action_repeat", cfg.frameskip)))
-    container.setdefault("time_limit", int(getattr(cfg, "time_limit", 0)))
-    return SimpleNamespace(**container)
-
-
-# ---------------------------------------------------------------------------
-# Env builder (評価用)
-# exp_dreamer/train.py と一致させる
+# Env builder
 # ---------------------------------------------------------------------------
 def make_eval_env(
-    cfg: DictConfig,
-    run_name: str,
+    env_id: str,
+    mt_wd: str,
+    mt_port: int,
+    frameskip: int,
+    seed: int,
     record_video: bool,
-    video_dir: Optional[str],
-    name_prefix: str,
+    video_dir: str,
+    obs_size: int,
 ):
+    if mt_port <= 0:
+        mt_port = pick_free_tcp_port()
+
     craftium_kwargs = dict(
-        run_dir_prefix=str(cfg.mt_wd),
-        mt_port=int(cfg.mt_port),
-        frameskip=int(cfg.frameskip),
+        run_dir_prefix=mt_wd,
+        mt_port=int(mt_port),
+        frameskip=int(frameskip),
         rgb_observations=True,
-        mt_listen_timeout=300_000,
-        seed=int(cfg.seed),
+        seed=int(seed),
     )
 
     if record_video:
-        if video_dir is None:
-            raise ValueError("record_video=True requires video_dir")
         os.makedirs(video_dir, exist_ok=True)
-        env = gym.make(cfg.env_id, render_mode="rgb_array", **craftium_kwargs)
-
-        safe_prefix = str(name_prefix).replace("/", "__")
+        env = gym.make(env_id, render_mode="rgb_array", **craftium_kwargs)
         env = gym.wrappers.RecordVideo(
-            env,
-            video_folder=video_dir,
-            name_prefix=safe_prefix,
-            episode_trigger=lambda episode_id: True,  # 全エピソード保存
-        )
+            env, video_folder=video_dir, episode_trigger=lambda _ep: True)
     else:
-        env = gym.make(cfg.env_id, **craftium_kwargs)
+        env = gym.make(env_id, **craftium_kwargs)
 
     env = gym.wrappers.RecordEpisodeStatistics(env)
     env = gym.wrappers.GrayScaleObservation(env, keep_dim=False)
-    env = gym.wrappers.ResizeObservation(env, int(cfg.obs_size))
+    env = gym.wrappers.ResizeObservation(env, int(obs_size))
     env = gym.wrappers.FrameStack(env, 1)
 
     env = GymV26ToV21(env)
     env = CraftiumObsDictWrapper(env, obs_key="image", channel_last=True)
-    if int(getattr(cfg, "time_limit", 0)) > 0:
-        env = wrappers.TimeLimit(env, int(cfg.time_limit))
 
     env = OneHotActionCompat(env)
-    env = wrappers.UUID(env)
-
+    env = dv3_wrappers.UUID(env)  # 訓練と揃える（ID 付与）
     return env
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Evaluation core
 # ---------------------------------------------------------------------------
-def evaluate(
+def evaluate_one_seed(
     agent_path: str,
+    env_id: str,
     num_episodes: int,
     seed: int,
-    frameskip: int,
-    record_video: bool,
-    video_dir: Optional[str],
     device_str: str,
-    obs_size: int,
+    record_video: bool,
+    video_dir: str,
     mt_wd: str,
     mt_port: int,
-    env_id: str,
-    config_yaml: Optional[str],
-) -> Dict[str, Any]:
-    device = torch.device(device_str if (torch.cuda.is_available() and device_str.startswith("cuda")) else "cpu")
-    print(f"[Eval] device={device}")
-    agent_path = resolve_agent_path(agent_path)
-    print(f"[Eval] agent_path={agent_path}")
-    print(f"[Eval] env_id={env_id}")
-    print(f"[Eval] episodes={num_episodes}")
-    print(f"[Eval] seed={seed}")
-    print(f"[Eval] frameskip={frameskip}")
-    print(f"[Eval] obs_size={obs_size}")
-    print(f"[Eval] mt_wd={mt_wd}")
-    print(f"[Eval] mt_port={mt_port}")
-    if record_video:
-        print(f"[Eval] video_dir={video_dir}")
+    deterministic: bool,
+    prefer_ckpt_cfg: bool,
+    frameskip_arg: int,
+    obs_size_arg: int,
+    probe_actions: bool,
+):
+    device = torch.device(device_str if (
+        torch.cuda.is_available() and str(device_str).startswith("cuda")) else "cpu")
 
-    # base cfg
-    base_cfg = OmegaConf.create(default_cfg_dict())
+    loaded_ckpt = torch.load(
+        agent_path, map_location="cpu", weights_only=False)
+    agent_state_dict, training_cfg = extract_state_dict_and_cfg(loaded_ckpt)
 
-    # load cfg from checkpoint if present
-    payload, ckpt_cfg = load_agent_payload(agent_path, device)
-
-    # load cfg from hydra config.yaml if found (ckpt_cfg が空のときの救済)
-    hydra_cfg = None
-    if (ckpt_cfg is None) or (len(ckpt_cfg.keys()) == 0):
-        if config_yaml is None:
-            config_yaml = find_hydra_config_yaml(agent_path)
-        if config_yaml is not None:
-            try:
-                hydra_cfg = OmegaConf.load(config_yaml)
-                print(f"[Eval] hydra config loaded: {config_yaml}")
-            except Exception as e:
-                print(f"[Eval] failed to load hydra config: {config_yaml} ({e})")
-
-    cfg = merge_cfg(base_cfg, ckpt_cfg if len(ckpt_cfg.keys()) > 0 else hydra_cfg)
-
-    # overwrite by CLI (明示指定を優先)
-    cfg.env_id = env_id
-    cfg.seed = int(seed)
-    cfg.frameskip = int(frameskip)
-    cfg.obs_size = int(obs_size)
-    cfg.num_envs = 1
-    cfg.mt_wd = str(mt_wd)
-    cfg.mt_port = int(mt_port)
-
-    # deterministic
-    random.seed(int(cfg.seed))
-    np.random.seed(int(cfg.seed))
-    torch.manual_seed(int(cfg.seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(cfg.seed))
-    torch.backends.cudnn.deterministic = bool(getattr(cfg, "torch_deterministic", True))
-
-    # local logdir for evaluation
-    ts = int(time.time())
-    eval_root = pathlib.Path(f"./eval_logs/{ts}")
-    eval_root.mkdir(parents=True, exist_ok=True)
-
-    dreamer_config = to_dreamer_config(cfg, "cuda" if device.type == "cuda" else "cpu", eval_root)
-    logdir = pathlib.Path(dreamer_config.logdir).expanduser()
-    logdir.mkdir(parents=True, exist_ok=True)
-
-    dreamer_config.traindir = logdir / "train_eps"
-    dreamer_config.evaldir = logdir / "eval_eps"
-    dreamer_config.traindir.mkdir(parents=True, exist_ok=True)
-    dreamer_config.evaldir.mkdir(parents=True, exist_ok=True)
-
-    # logger
-    logger = tools.Logger(logdir, 0)
-
-    # datasets (空でも train.py と同様に作る)
-    train_eps = tools.load_episodes(dreamer_config.traindir, limit=int(getattr(dreamer_config, "dataset_size", 1000)))
-    train_dataset = dv3.make_dataset(train_eps, dreamer_config)
+    # cfg を優先して env 設定を決める
+    if prefer_ckpt_cfg and isinstance(training_cfg, dict):
+        frameskip = as_int(training_cfg.get(
+            "frameskip", frameskip_arg), frameskip_arg)
+        obs_size = as_int(training_cfg.get(
+            "obs_size", obs_size_arg), obs_size_arg)
+        action_repeat = as_int(training_cfg.get("action_repeat", 1), 1)
+        time_limit = as_int(training_cfg.get("time_limit", 0), 0)
+    else:
+        frameskip = int(frameskip_arg)
+        obs_size = int(obs_size_arg)
+        action_repeat = 1
+        time_limit = 0
 
     # env
-    run_name = f"{cfg.env_id}__eval__{cfg.seed}__{ts}"
-    name_prefix = f"eval_seed{cfg.seed}"
     env = make_eval_env(
-        cfg=cfg,
-        run_name=run_name,
+        env_id=env_id,
+        mt_wd=mt_wd,
+        mt_port=mt_port,
+        frameskip=frameskip,
+        seed=seed,
         record_video=record_video,
         video_dir=video_dir,
-        name_prefix=name_prefix,
+        obs_size=obs_size,
     )
-    env = Damy(env)
 
-    # action size
-    acts = env.action_space
-    dreamer_config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
+    def to_scalar(x) -> float:
+        return float(np.asarray(x).reshape(()))
 
-    # agent
-    agent = dv3.Dreamer(
-        env.observation_space,
-        env.action_space,
-        dreamer_config,
-        logger,
-        train_dataset,
-    ).to(device)
+    def angle_delta(prev: float, cur: float) -> float:
+        wrap = 360.0 if (abs(prev) > 10.0 or abs(cur)
+                         > 10.0) else (2.0 * np.pi)
+        d = cur - prev
+        d = (d + wrap / 2.0) % wrap - wrap / 2.0
+        return float(d)
+
+    def to_vec3(x) -> np.ndarray:
+        v = np.asarray(x, dtype=np.float32).reshape(-1)
+        return v[:3] if v.size >= 3 else np.pad(v, (0, 3 - v.size), constant_values=0.0)
+
+    def run_action_probe(env, steps: int = 20):
+        action_count = int(env.action_space.shape[0]) if hasattr(
+            env.action_space, "shape") else 0
+        print(f"[Probe] action_count={action_count} steps={steps}")
+        if action_count <= 0:
+            print("[Probe] action_space が想定外なので中止")
+            return
+
+        for action_index in range(action_count):
+            obs = env.reset()
+            prev_img = obs["image"].astype(np.int16)
+
+            prev_yaw = None
+            prev_pitch = None
+            prev_pos = None
+
+            sum_absdiff = 0.0
+            sum_reward = 0.0
+            sum_abs_dyaw = 0.0
+            sum_abs_dpitch = 0.0
+            sum_dpos = 0.0
+            count_delta = 0
+
+            done = False
+
+            onehot = np.zeros((action_count,), dtype=np.float32)
+            onehot[action_index] = 1.0
+
+            for t in range(steps):
+                obs, reward, done, info = env.step(onehot)
+
+                cur_img = obs["image"].astype(np.int16)
+                sum_absdiff += float(np.mean(np.abs(cur_img - prev_img)))
+                prev_img = cur_img
+
+                sum_reward += float(reward)
+
+                yaw = to_scalar(info.get("player_yaw", 0.0))
+                pitch = to_scalar(info.get("player_pitch", 0.0))
+                pos = to_vec3(
+                    info.get("player_pos", np.zeros(3, dtype=np.float32)))
+
+                if prev_yaw is not None:
+                    sum_abs_dyaw += abs(angle_delta(prev_yaw, yaw))
+                    sum_abs_dpitch += abs(angle_delta(prev_pitch, pitch))
+                    sum_dpos += float(np.linalg.norm(pos - prev_pos))
+                    count_delta += 1
+
+                prev_yaw, prev_pitch, prev_pos = yaw, pitch, pos
+
+                if done:
+                    break
+
+            denom_img = max(1, (t + 1))
+            denom_delta = max(1, count_delta)
+
+            mean_absdiff = sum_absdiff / denom_img
+            mean_abs_dyaw = sum_abs_dyaw / denom_delta
+            mean_abs_dpitch = sum_abs_dpitch / denom_delta
+            mean_dpos = sum_dpos / denom_delta
+
+            print(
+                f"[Probe] action={action_index} "
+                f"mean_absdiff={mean_absdiff:.2f} "
+                f"mean_abs_dyaw={mean_abs_dyaw:.4f} "
+                f"mean_abs_dpitch={mean_abs_dpitch:.4f} "
+                f"mean_dpos={mean_dpos:.4f} "
+                f"reward_sum={sum_reward:.2f} done={done}"
+            )
+
+    if probe_actions:
+        run_action_probe(env, steps=20)
+        env.close()
+        return {"probe_only": True}
+
+    if time_limit > 0:
+        env = dv3_wrappers.TimeLimit(env, int(time_limit))
+
+    obs_space = env.observation_space
+    act_space = env.action_space
+    num_actions = int(act_space.shape[0]) if hasattr(
+        act_space, "shape") else int(getattr(act_space, "n"))
+
+    # Dreamer config は cfg から復元して形状一致を最優先する
+    if isinstance(training_cfg, dict):
+        dreamer_config = make_dreamer_config_from_training_cfg(
+            training_cfg=training_cfg,
+            device_str=str(device_str),
+            num_envs=1,
+            num_actions=num_actions,
+            deterministic_eval=deterministic,
+        )
+    else:
+        dreamer_config = SimpleNamespace(
+            device=str(device_str),
+            size=[obs_size, obs_size],
+            action_repeat=int(action_repeat),
+            compile=False,
+            precision=32,
+            debug=False,
+            eval_state_mean=bool(deterministic),
+            num_actions=int(num_actions),
+        )
+
+    # logger と dataset は評価では使わない前提でダミー
+    class DummyLogger:
+        def __init__(self, step=0):
+            self.step = step
+
+        def scalar(self, *_args, **_kwargs):
+            return None
+
+        def image(self, *_args, **_kwargs):
+            return None
+
+        def video(self, *_args, **_kwargs):
+            return None
+
+        def write(self, *_args, **_kwargs):
+            return None
+
+    dummy_logger = DummyLogger(step=0)
+    dummy_dataset = iter([])
+
+    agent = dv3.Dreamer(obs_space, act_space, dreamer_config,
+                        dummy_logger, dummy_dataset).to(device)
     agent.requires_grad_(requires_grad=False)
 
-    # load weights
-    agent.load_state_dict(payload["agent_state_dict"], strict=True)
-    agent.eval()
-    print("[Eval] agent loaded")
+    # 重みロード
+    agent_state_dict = {k: v.to(device) for k, v in agent_state_dict.items()}
+    load_report = load_state_dict_no_crash(agent, agent_state_dict)
 
-    # simulate N episodes (train.py の eval と同様)
-    eval_eps = tools.load_episodes(dreamer_config.evaldir, limit=1_000_000)
-    prev_keys = set(eval_eps.keys())
-
-    eval_policy = functools.partial(agent, training=False)
-    tools.simulate(
-        eval_policy,
-        [env],
-        eval_eps,
-        dreamer_config.evaldir,
-        logger,
-        is_eval=True,
-        episodes=int(num_episodes),
+    lr = load_report
+    print(
+        f"[Load] mode={lr.get('mode')} "
+        f"filtered_out={len(lr.get('filtered_out', []))} "
+        f"missing={len(lr.get('missing_keys', []))} "
+        f"unexpected={len(lr.get('unexpected_keys', []))}"
     )
 
-    # extract new episodes
-    new_keys = [k for k in eval_eps.keys() if k not in prev_keys]
-    if not new_keys:
-        print("[Eval] no new episodes were collected (unexpected).")
-        new_eps = []
-    else:
-        new_eps = [eval_eps[k] for k in new_keys]
+    episode_rewards = []
+    episode_lengths = []
+    episode_chops = []
+    episode_records = []  # エピソード単位の詳細
 
-    episode_returns: List[float] = []
-    episode_lengths_env: List[int] = []
-    episode_lengths_real: List[int] = []
-    episode_chops: List[float] = []
+    def safe_reset(env, seed_value: Optional[int] = None):
+        try:
+            if seed_value is None:
+                return env.reset()
+            return env.reset(seed=int(seed_value))
+        except TypeError:
+            return env.reset()
 
-    for i, ep in enumerate(new_eps):
-        rew = ep.get("reward", None)
-        if rew is None:
-            rsum = 0.0
-            elen = 0
-        else:
-            rew_arr = np.asarray(rew, dtype=np.float32)
-            rsum = float(rew_arr.sum())
-            elen = int(rew_arr.shape[0])
+    for episode_index in range(int(num_episodes)):
+        obs = safe_reset(env, int(seed) + episode_index)
 
-        chops = rsum  # ChopTree は reward 合計が chops
-        episode_returns.append(rsum)
-        episode_lengths_env.append(elen)
-        episode_lengths_real.append(int(elen * int(cfg.frameskip)))
-        episode_chops.append(chops)
+        done = False
+        episode_reward = 0.0
+        episode_length = 0
+        episode_chop_count = 0
+        agent_state = None
+        action_index_hist = []
 
-        print(f"  Episode {i+1}/{len(new_eps)}: return={rsum:.1f}, len_env={elen}, len_real={elen*int(cfg.frameskip)}, chops={chops:.1f}")
+        # episode 初期化: kinematics 集計用
+        prev_yaw = None
+        prev_pitch = None
+        prev_pos = None
+        action_counts = np.zeros((num_actions,), dtype=np.int64)
+        sum_abs_dyaw = np.zeros((num_actions,), dtype=np.float64)
+        sum_abs_dpitch = np.zeros((num_actions,), dtype=np.float64)
+        sum_dpos = np.zeros((num_actions,), dtype=np.float64)
+        count_delta = np.zeros((num_actions,), dtype=np.int64)
 
-    # close
-    try:
-        env.close()
-    except Exception:
-        pass
+        while not done:
+            obs_batch = {k: np.expand_dims(v, 0) for k, v in obs.items()}
+            reset_flag = np.asarray(
+                [bool(obs.get("is_first", False))], dtype=np.bool_)
 
-    if len(episode_returns) == 0:
-        # 空防止
-        results = dict(
-            agent_path=agent_path,
-            env_id=cfg.env_id,
-            num_episodes=int(num_episodes),
-            seed=int(cfg.seed),
-            frameskip=int(cfg.frameskip),
-            obs_size=int(cfg.obs_size),
-            mt_wd=str(cfg.mt_wd),
-            mt_port=int(cfg.mt_port),
-            episode_returns=[],
-            episode_lengths_env=[],
-            episode_lengths_real=[],
-            episode_chops=[],
-            mean_return=0.0,
-            std_return=0.0,
-            mean_length_env=0.0,
-            mean_length_real=0.0,
-            mean_chops=0.0,
-            std_chops=0.0,
-            video_dir=video_dir if record_video else None,
+            with torch.no_grad():
+                policy_output, agent_state = agent(
+                    obs_batch, reset_flag, agent_state, training=False)
+
+            # 予測 reward と実 reward のズレを見る（最初の数 step だけ）
+            if episode_length < 30:
+                latent_torch, action_torch = agent_state
+
+                # (A) 現在 latent の reward 予測
+                try:
+                    feat = agent._wm.dynamics.get_feat(latent_torch)
+                    reward_pred = agent._wm.heads["reward"](feat).mean()
+                    reward_pred_value = float(
+                        reward_pred.detach().cpu().item())
+                except Exception:
+                    reward_pred_value = None
+
+                # (B) 選んだ action を入れた「次 latent」の reward 予測（actor が実際に最適化している側に近い）
+                try:
+                    next_latent = agent._wm.dynamics.img_step(
+                        latent_torch, action_torch)
+                    next_feat = agent._wm.dynamics.get_feat(next_latent)
+                    reward_pred_next = agent._wm.heads["reward"](
+                        next_feat).mean()
+                    reward_pred_next_value = float(
+                        reward_pred_next.detach().cpu().item())
+                except Exception:
+                    reward_pred_next_value = None
+
+            # actor 分布を観測（最初の数 step だけ）
+            if episode_length < 10:
+                # state=(latent, action)
+                latent_torch, _prev_action = agent_state
+                feat = agent._wm.dynamics.get_feat(latent_torch)
+                actor_dist = agent._task_behavior.actor(feat)
+
+                entropy_value = None
+                if hasattr(actor_dist, "entropy"):
+                    try:
+                        entropy_value = float(
+                            actor_dist.entropy().mean().detach().cpu().item())
+                    except Exception:
+                        entropy_value = None
+
+                logits = getattr(actor_dist, "logits", None)
+                if logits is None and hasattr(actor_dist, "base_dist") and hasattr(actor_dist.base_dist, "logits"):
+                    logits = actor_dist.base_dist.logits
+
+                if logits is not None:
+                    probs = torch.softmax(logits, dim=-1)
+                    topk = min(3, probs.shape[-1])
+                    topv, topi = torch.topk(probs, k=topk, dim=-1)
+                    top_idx = topi[0].detach().cpu().tolist()
+                    top_p = [float(x) for x in topv[0].detach().cpu().tolist()]
+                    print(
+                        f"[ActorDist] entropy={entropy_value} top{topk}_idx={top_idx} top{topk}_p={top_p}")
+                else:
+                    print(
+                        f"[ActorDist] entropy={entropy_value} dist_type={type(actor_dist)}")
+
+            action = policy_output.get("action", policy_output)
+
+            # --- DEBUG: action の中身を観測する ---
+            if torch.is_tensor(action):
+                action_np = action.detach().cpu().numpy()
+            else:
+                action_np = np.asarray(action)
+
+            if action_np.ndim == 0 or action_np.size == 1:
+                action_index = int(action_np.reshape(()))
+                action_max = float(action_np.reshape(()))
+            else:
+                action_index = int(np.argmax(action_np, axis=-1).item() if hasattr(
+                    np.argmax(action_np, axis=-1), "item") else np.argmax(action_np, axis=-1))
+                action_max = float(np.max(action_np))
+
+            action_index_hist.append(action_index)
+
+            # step を先に行い、reward/info を確定させる
+            next_obs, reward, done, info = env.step(action)
+
+            # RewardCheck は reward が確定した後にだけ出す
+            if episode_length < 30:
+                print(
+                    f"[RewardCheck] step={episode_length:03d} "
+                    f"reward_pred={reward_pred_value} reward_pred_next={reward_pred_next_value} "
+                    f"reward_env={float(reward)} action_index={action_index}"
+                )
+
+            # --- kinematics trace end ---
+
+            episode_reward += float(reward)
+            episode_length += 1
+
+            if float(reward) >= 1.0:
+                episode_chop_count += 1
+
+            obs = next_obs
+
+        episode_rewards.append(float(episode_reward))
+        episode_lengths.append(int(episode_length * frameskip))
+        episode_chops.append(int(episode_chop_count))
+
+        episode_records.append(
+            {
+                "episode_index": int(episode_index),
+                "reset_seed": int(seed) + int(episode_index),
+                "chops": int(episode_chop_count),
+                "reward_sum": float(episode_reward),
+                "length_steps": int(episode_length),
+                "length_env_frames": int(episode_length * frameskip),
+            }
         )
-        return results
 
-    results = {
-        "agent_path": agent_path,
-        "env_id": cfg.env_id,
+        # エピソードごとの chops を表示
+        print(
+            f"[EpisodeChops] episode={episode_index} "
+            f"seed={seed}+{episode_index}={int(seed)+int(episode_index)} "
+            f"chops={episode_chop_count} "
+            f"reward_sum={episode_reward:.2f} "
+            f"len_steps={episode_length} len_frames={int(episode_length * frameskip)}"
+        )
+
+        unique_actions = sorted(set(action_index_hist))
+        print(
+            f"[EpisodeSummary] unique_actions={len(unique_actions)} first20={action_index_hist[:20]} last20={action_index_hist[-20:]}")
+        print("[ActionHistogram]", {i: int(c)
+              for i, c in enumerate(action_counts) if c > 0})
+
+        for i in range(num_actions):
+            if action_counts[i] <= 0:
+                continue
+            denom = max(1, int(count_delta[i]))
+            print(
+                f"[ActionKinematics] action={i} "
+                f"count={int(action_counts[i])} "
+                f"mean_abs_dyaw={float(sum_abs_dyaw[i]/denom):.4f} "
+                f"mean_abs_dpitch={float(sum_abs_dpitch[i]/denom):.4f} "
+                f"mean_dpos={float(sum_dpos[i]/denom):.4f}"
+            )
+
+    # seed 内の min/max を表示
+    if episode_chops:
+        min_ep = int(np.argmin(np.asarray(episode_chops)))
+        max_ep = int(np.argmax(np.asarray(episode_chops)))
+        print("\n" + "-" * 70)
+        print("[ChopsMinMax]")
+        print(
+            f"  min: episode={min_ep} chops={episode_chops[min_ep]} reward_sum={episode_rewards[min_ep]:.2f} len_frames={episode_lengths[min_ep]}")
+        print(
+            f"  max: episode={max_ep} chops={episode_chops[max_ep]} reward_sum={episode_rewards[max_ep]:.2f} len_frames={episode_lengths[max_ep]}")
+        min_val = int(np.min(np.asarray(episode_chops)))
+        max_val = int(np.max(np.asarray(episode_chops)))
+        min_eps = [i for i, v in enumerate(episode_chops) if v == min_val]
+        max_eps = [i for i, v in enumerate(episode_chops) if v == max_val]
+        print(f"[ChopsTies] min_chops={min_val} episodes={min_eps}")
+        print(f"[ChopsTies] max_chops={max_val} episodes={max_eps}")
+        print("-" * 70)
+
+    env.close()
+
+    return {
+        "seed": int(seed),
+        "agent_path": str(agent_path),
+        "env_id": str(env_id),
         "num_episodes": int(num_episodes),
-        "seed": int(cfg.seed),
-        "frameskip": int(cfg.frameskip),
-        "obs_size": int(cfg.obs_size),
-        "mt_wd": str(cfg.mt_wd),
-        "mt_port": int(cfg.mt_port),
-        "episode_returns": episode_returns,
-        "episode_lengths_env": episode_lengths_env,
-        "episode_lengths_real": episode_lengths_real,
+        "device": str(device),
+        "used_obs_size": int(obs_size),
+        "used_frameskip": int(frameskip),
+        "used_action_repeat": int(getattr(dreamer_config, "action_repeat", 1)),
+        "load_report": load_report,
+        "episode_rewards": episode_rewards,
+        "episode_lengths": episode_lengths,
         "episode_chops": episode_chops,
-        "mean_return": float(np.mean(episode_returns)),
-        "std_return": float(np.std(episode_returns)),
-        "min_return": float(np.min(episode_returns)),
-        "max_return": float(np.max(episode_returns)),
-        "mean_length_env": float(np.mean(episode_lengths_env)),
-        "mean_length_real": float(np.mean(episode_lengths_real)),
-        "std_length_real": float(np.std(episode_lengths_real)),
-        "mean_chops": float(np.mean(episode_chops)),
-        "std_chops": float(np.std(episode_chops)),
-        "video_dir": video_dir if record_video else None,
+        "episode_records": episode_records,  # 追加
+        "mean_reward": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
+        "std_reward": float(np.std(episode_rewards)) if episode_rewards else 0.0,
+        "mean_chops": float(np.mean(episode_chops)) if episode_chops else 0.0,
+        "std_chops": float(np.std(episode_chops)) if episode_chops else 0.0,
     }
-
-    print("\n" + "=" * 60)
-    print("Evaluation Results (Dreamer)")
-    print("=" * 60)
-    print(f"  Mean Return:  {results['mean_return']:.2f} ± {results['std_return']:.2f}")
-    print(f"  Min/Max:      {results['min_return']:.1f} / {results['max_return']:.1f}")
-    print(f"  Mean Length:  {results['mean_length_real']:.0f} ± {results['std_length_real']:.0f} (real steps)")
-    print(f"  Mean Chops:   {results['mean_chops']:.2f} ± {results['std_chops']:.2f}")
-    print("=" * 60)
-
-    return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate Craftium Dreamer agent (single seed)")
-    parser.add_argument("--agent-path", type=str, required=True, help="Path to agent .pt (state_dict or checkpoint) OR directory containing .pt")
-    parser.add_argument("--env-id", type=str, default="Craftium/ChopTree-v0", help="Environment ID")
-    parser.add_argument("--num-episodes", type=int, default=10, help="Number of episodes")
-    parser.add_argument("--no-video", action="store_true", help="Disable video recording")
-    parser.add_argument("--video-dir", type=str, default=None, help="Video output directory")
-    parser.add_argument("--mt-wd", type=str, default="./eval_runs", help="Minetest run directory prefix")
-    parser.add_argument("--mt-port", type=int, default=49200, help="Minetest port")
-    parser.add_argument("--frameskip", type=int, default=4, help="Frame skip (must match training)")
-    parser.add_argument("--obs-size", type=int, default=64, help="Resize observation size (must match training)")
-    parser.add_argument("--seed", type=int, default=42, help="Seed")
-    parser.add_argument("--device", type=str, default="cuda", help="cuda/cpu")
-    parser.add_argument("--config-yaml", type=str, default=None, help="Optional: path to Hydra config.yaml (/.hydra/config.yaml)")
-    parser.add_argument("--output-json", type=str, default=None, help="Save evaluation results to JSON")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--agent-path", type=str, required=True)
+    parser.add_argument("--env-id", type=str, default="Craftium/ChopTree-v0")
+    parser.add_argument("--num-episodes", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed-num", type=int, default=1, choices=[1, 2, 3])
+    parser.add_argument("--device", type=str, default="cuda")
+
+    parser.add_argument("--no-video", action="store_true")
+    parser.add_argument("--video-dir", type=str, default=None)
+
+    parser.add_argument("--mt-wd", type=str, default="./eval_runs")
+    parser.add_argument("--mt-port", type=int, default=0,
+                        help="0 なら空きポートを自動選択する")
+
+    parser.add_argument("--frameskip", type=int, default=4,
+                        help="cfg が無い場合のフォールバック")
+    parser.add_argument("--obs-size", type=int, default=84,
+                        help="cfg が無い場合のフォールバック")
+
+    parser.add_argument("--deterministic", action="store_true",
+                        help="eval_state_mean を True にする")
+    parser.add_argument("--prefer-ckpt-cfg", action="store_true",
+                        help="checkpoint 内 cfg を優先する（推奨）")
+    parser.add_argument("--output-json", type=str, default=None)
+    parser.add_argument("--probe-actions", action="store_true",
+                        help="各actionを固定入力して挙動を計測し終了")
+
     args = parser.parse_args()
 
-    # video dir default
     if args.video_dir is None:
-        ts = int(time.time())
-        args.video_dir = f"./eval_videos/eval_{ts}"
+        args.video_dir = f"./eval_videos/eval_{int(time.time())}"
 
+    os.makedirs(args.mt_wd, exist_ok=True)
     if not args.no_video:
         os.makedirs(args.video_dir, exist_ok=True)
-    os.makedirs(args.mt_wd, exist_ok=True)
 
-    results = evaluate(
-        agent_path=args.agent_path,
-        num_episodes=args.num_episodes,
-        seed=args.seed,
-        frameskip=args.frameskip,
-        record_video=(not args.no_video),
-        video_dir=(args.video_dir if not args.no_video else None),
-        device_str=args.device,
-        obs_size=args.obs_size,
-        mt_wd=args.mt_wd,
-        mt_port=args.mt_port,
-        env_id=args.env_id,
-        config_yaml=args.config_yaml,
-    )
+    # seed の扱いは引数 seed を起点に +1
+    eval_seeds = [int(args.seed) + i for i in range(int(args.seed_num))]
+
+    all_results = []
+    for seed_value in eval_seeds:
+        per_seed_video_dir = args.video_dir
+        if not args.no_video:
+            per_seed_video_dir = os.path.join(
+                args.video_dir, f"seed{seed_value}")
+            os.makedirs(per_seed_video_dir, exist_ok=True)
+
+        result = evaluate_one_seed(
+            agent_path=args.agent_path,
+            env_id=args.env_id,
+            num_episodes=int(args.num_episodes),
+            seed=int(seed_value),
+            device_str=str(args.device),
+            record_video=(not args.no_video),
+            video_dir=per_seed_video_dir,
+            mt_wd=str(args.mt_wd),
+            mt_port=int(args.mt_port),
+            deterministic=bool(args.deterministic),
+            prefer_ckpt_cfg=bool(args.prefer_ckpt_cfg) or True,
+            frameskip_arg=int(args.frameskip),
+            obs_size_arg=int(args.obs_size),
+            probe_actions=bool(args.probe_actions),
+        )
+        all_results.append(result)
+
+        if bool(args.probe_actions):
+            print("[Probe] finished")
+            return
+
+        lr = result["load_report"]
+        print("\n" + "#" * 70)
+        print(f"[Eval] seed={seed_value}")
+        print(
+            f"  used_obs_size={result['used_obs_size']} used_frameskip={result['used_frameskip']} action_repeat={result['used_action_repeat']}")
+        print(f"  load_mode={lr.get('mode')}")
+        if lr.get("mode") != "strict":
+            print(f"  first_error={lr.get('first_error')}")
+            print(
+                f"  filtered_out={len(lr.get('filtered_out', []))} missing={len(lr.get('missing_keys', []))} unexpected={len(lr.get('unexpected_keys', []))}")
+        print(
+            f"  mean_reward={result['mean_reward']:.2f} mean_chops={result['mean_chops']:.2f}")
+        print("#" * 70)
+
+    mean_rewards = [r["mean_reward"] for r in all_results]
+    mean_chops = [r["mean_chops"] for r in all_results]
+
+    print("\n" + "=" * 60)
+    print("Multi-Seed Summary")
+    print("=" * 60)
+    for r in all_results:
+        print(
+            f"  seed={r['seed']}: mean_reward={r['mean_reward']:.2f}, mean_chops={r['mean_chops']:.2f}")
+    print("-" * 60)
+    print(
+        f"  over_seeds: mean_reward={float(np.mean(mean_rewards)):.2f} ± {float(np.std(mean_rewards)):.2f}")
+    print(
+        f"  over_seeds: mean_chops={float(np.mean(mean_chops)):.2f} ± {float(np.std(mean_chops)):.2f}")
+    print("=" * 60)
 
     if args.output_json:
+        out = {
+            "runs": all_results,
+            "agg": {
+                "seed_num": int(args.seed_num),
+                "seeds": eval_seeds,
+                "mean_reward_over_seeds": float(np.mean(mean_rewards)),
+                "std_reward_over_seeds": float(np.std(mean_rewards)),
+                "mean_chops_over_seeds": float(np.mean(mean_chops)),
+                "std_chops_over_seeds": float(np.std(mean_chops)),
+            },
+        }
         os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
         with open(args.output_json, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        print(f"\n[Eval] results saved to: {args.output_json}")
-
-    if not args.no_video:
-        print(f"[Eval] videos saved to: {args.video_dir}")
+            json.dump(out, f, ensure_ascii=False, indent=2)
+        print(f"[Eval] saved: {args.output_json}")
 
 
 if __name__ == "__main__":
