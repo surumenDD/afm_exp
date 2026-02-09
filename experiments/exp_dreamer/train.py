@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Craftium Dreamer experiment runner (Hydra + WandB + logging + timestamped outputs).
+"""
+Craftium Dreamer Experiment Runner (Hydra + WandB)
 
-このモジュールは、DreamerV3エージェントをCraftium環境で学習させるためのメインスクリプトです。
-Hydraによる設定管理、WandBによる実験トラッキング、チェックポイント管理、ロギングなどの機能を提供します。
+主な機能:
+- DreamerV3 エージェントを Craftium 環境で学習させるためのメインスクリプト。
+- Hydra による設定管理、WandB による実験トラッキング、チェックポイント管理、ロギング機能を提供。
 
-Base references:
+References:
     - craftium_exp/experiments/exp__lstmppo (logging/checkpoint/resume style)
     - dreamerv3-torch (https://github.com/NM512/dreamerv3-torch)
 """
@@ -175,7 +177,7 @@ class OneHotActionCompat(gym.ActionWrapper):
         Raises:
             TypeError: サポートされていないアクション形式の場合
         """
-        # ★ 追加: Dreamerが dict を返すケース対応
+        # Helper: Dreamerが dict を返すケースへの対応
         if isinstance(action, dict):
             # Dreamerの出力はだいたい action["action"] に入っている
             if "action" in action:

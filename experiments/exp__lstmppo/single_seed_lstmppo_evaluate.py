@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Craftium PPO(LSTM) 学習済みエージェントの評価スクリプト（単発seed）
-- lstm_ppo_train.py と同じ前処理・同じネットワーク構造（CNN + LSTM）
-- 複数エピソード実行して平均報酬・平均長などを表示
-- 動画録画（RecordVideo）対応
-- agent_state_dict形式チェックポイント / state_dict単体の両方を自動判別してロード
+Craftium PPO(LSTM) 学習済みエージェントの評価スクリプト (Single-seed)
+
+主な機能:
+- lstm_ppo_train.py と同一の前処理・ネットワーク構造 (CNN + LSTM) を使用。
+- 指定されたシードで複数エピソードを実行し、平均報酬やエピソード長を算出します。
+- 動画保存 (RecordVideo) に対応。
+- チェックポイントの形式 (`agent_state_dict` または `state_dict` そのもの) を自動判別してロードします。
 """
 
 import os
@@ -23,8 +25,7 @@ import craftium
 
 
 # --------------------------
-# Env builder (match training)
-# --------------------------
+# Environment Builder (Training時の設定に合わせる)
 def make_eval_env(
     env_id: str,
     mt_wd: str,
@@ -39,7 +40,7 @@ def make_eval_env(
         run_dir_prefix=mt_wd,
         mt_port=mt_port,
         frameskip=frameskip,
-        rgb_observations=True,  # trainingと同じ
+        rgb_observations=True,  # Training時と同様にRGBで観測を受け取る（後段でグレースケール化）
         mt_listen_timeout=300_000,
         seed=int(seed),
     )
@@ -57,13 +58,13 @@ def make_eval_env(
             env,
             video_folder=video_dir,
             name_prefix=safe_prefix,
-            episode_trigger=lambda episode_id: True,  # ★全エピソード保存
+            episode_trigger=lambda episode_id: True,  # 全エピソードを保存
         )
     else:
         env = gym.make(env_id, **craftium_kwargs)
 
 
-    # trainingと完全一致の前処理
+    # Trainingと完全に一致する前処理を適用
     env = gym.wrappers.RecordEpisodeStatistics(env)
     env = gym.wrappers.GrayScaleObservation(env, keep_dim=False)
     env = gym.wrappers.ResizeObservation(env, 84)
@@ -73,8 +74,7 @@ def make_eval_env(
 
 
 # --------------------------
-# Agent (must match training)
-# --------------------------
+# Agent (Training時の定義に合わせる)
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
@@ -143,16 +143,15 @@ class Agent(nn.Module):
 
 
 # --------------------------
-# Checkpoint loader (auto-detect)
-# --------------------------
+# Checkpoint Loader
 def load_agent_state_dict(path: str, device: torch.device) -> dict:
     obj = torch.load(path, map_location=device)
 
-    # trainingのcheckpoint形式: {"agent_state_dict": ..., ...}
+    # Training時のcheckpoint形式: {"agent_state_dict": ..., ...}
     if isinstance(obj, dict) and "agent_state_dict" in obj:
         return obj["agent_state_dict"]
 
-    # trainingのsave_agent形式: state_dictそのもの
+    # Training時のsave_agent形式: state_dictそのもの
     if isinstance(obj, dict):
         return obj
 

@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
-# Craftium PPO(LSTM) experiment runner (Hydra + WandB + logging + timestamped outputs)
+# Craftium PPO(LSTM) Experiment Runner
 #
-# Base: CleanRL ppo_atari_lstm.py
+# 機能:
+# - Hydraによる設定管理
+# - WandBによる実験トラッキング
+# - ログ出力およびタイムスタンプ付きの成果物保存
+#
+# Base implementation: CleanRL ppo_atari_lstm.py
 # https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppo_atari_lstm.py
 
 import os
@@ -61,7 +66,7 @@ def make_env(cfg, idx, run_name):
             video_folder = "videos"
             os.makedirs(video_folder, exist_ok=True)
 
-            # ★ "/" が入ると videos/Craftium/... みたいにディレクトリ扱いになって死ぬので潰す
+            # "/" が含まれるとディレクトリ階層として解釈されてエラーになるため、置換する
             safe_prefix = run_name.replace("/", "__")
 
             env = gym.wrappers.RecordVideo(
@@ -75,7 +80,7 @@ def make_env(cfg, idx, run_name):
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.GrayScaleObservation(env, keep_dim=False)
         env = gym.wrappers.ResizeObservation(env, 84)
-        env = AddChannelDim(env)   # ★(84,84) -> (1,84,84)
+        env = AddChannelDim(env)   # (84, 84) -> (1, 84, 84)
         return env
 
     return thunk
@@ -152,7 +157,7 @@ def setup_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
-    # 二重登録を防ぐ（Hydra環境で再実行される場合に備える）
+    # 二重登録を防ぐ（Hydra環境での再実行対策）
     if len(logger.handlers) > 0:
         return
 
@@ -168,7 +173,7 @@ def setup_logging():
 
 
 # --------------------------
-# ★Checkpoint helpers
+# Checkpoint Helpers
 # --------------------------
 def _find_latest_checkpoint_in_dir(ckpt_dir: str) -> Optional[str]:
     if not ckpt_dir or (not os.path.isdir(ckpt_dir)):
@@ -304,8 +309,8 @@ def main(cfg: DictConfig):
         cfg.seed = t
 
     # --------------------------
-    # ★Sanity: LSTM PPOでは num_minibatches は num_envs の約数である必要がある
-    # - num_envs=1, num_minibatches>1 だと必ず AssertionError になるため、ここで自動補正する
+    # Sanity check: LSTM PPOでは num_minibatches は num_envs の約数である必要がある
+    # - num_envs=1, num_minibatches>1 の場合、必ず AssertionError になるため自動補正する
     # --------------------------
     cfg.num_envs = int(cfg.num_envs)
     cfg.num_steps = int(cfg.num_steps)
@@ -446,7 +451,7 @@ def main(cfg: DictConfig):
     )
 
     # --------------------------
-    # ★resume: agent/optimizer/global_step/iteration を復元（追加）
+    # Resume: agent, optimizer, global_step, iteration を復元
     # --------------------------
     global_step = 0
     resume_iteration = 0
@@ -652,7 +657,7 @@ def main(cfg: DictConfig):
                 if wandb_run is not None:
                     wandb_run.save(path)
 
-        # ★save checkpoint
+        # Save Checkpoint
         if bool(getattr(cfg, "save_checkpoint", True)):
             ckpt_every = int(getattr(cfg, "checkpoint_every", 1))
             if ckpt_every <= 0:

@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Craftium PPO(LSTM) 学習済みエージェントの評価スクリプト（multi-seed）
-- lstm_ppo_train.py と同じ前処理・同じネットワーク構造（CNN + LSTM）
-- 固定seed [42, 123, 456] の先頭N個で評価し、seed間平均を出す
-- 動画録画（RecordVideo）対応：seedごとに保存先を分ける
-- agent_state_dict形式チェックポイント / state_dict単体の両方を自動判別してロード
+Craftium PPO(LSTM) 学習済みエージェントの評価スクリプト (Multi-seed)
+
+主な機能:
+- lstm_ppo_train.py と同一の前処理・ネットワーク構造 (CNN + LSTM) を使用して評価を行います。
+- 固定シード [42, 123, 456] を使用して評価し、シード間の平均パフォーマンスを算出します。
+- 動画保存 (RecordVideo) に対応しており、シードごとにディレクトリを分けて保存します。
+- チェックポイントは `agent_state_dict` 形式と `state_dict` 単体の両方に対応し、自動で判別してロードします。
 """
 
 import os
@@ -22,8 +24,7 @@ import craftium
 
 
 # --------------------------
-# Env builder (match training)
-# --------------------------
+# Environment Builder (Training時の設定に合わせる)
 def make_eval_env(
     env_id: str,
     mt_wd: str,
@@ -66,8 +67,7 @@ def make_eval_env(
     return env
 
 
-# --------------------------
-# Agent (must match training)
+# Agent (Training時のネットワーク定義に合わせる)
 # --------------------------
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -132,9 +132,7 @@ class Agent(nn.Module):
         return action, lstm_state
 
 
-# --------------------------
-# Checkpoint loader (auto-detect)
-# --------------------------
+# Checkpoint Loader
 def load_agent_state_dict(path: str, device: torch.device) -> dict:
     obj = torch.load(path, map_location=device)
     if isinstance(obj, dict) and "agent_state_dict" in obj:

@@ -1,11 +1,11 @@
 
-## experiments/exp_armfmppo/single_seed_armfmppo_evaluate.py
-# -*- coding: utf-8 -*-
 """
-ARMFM+PPO 学習済みエージェント評価（単発 seed / 複数固定 seed）
-- training と同じ obs 前処理: RecordEpisodeStatistics + FrameStack(4)
-- ARM-FM 評価時: armfm_artifacts を読み、RM 状態 embedding を z として与える
-- agent の checkpoint 形式は state_dict を想定（必要なら dict 判別も追加可能）
+ARMFM+PPO 学習済みエージェント評価 (Single-seed / Multi-seed)
+
+主な機能:
+- Training時と同一の観測前処理 (RecordEpisodeStatistics + FrameStack(4)) を適用。
+- ARM-FM 評価: armfm_artifacts を読み込み、Reward Machine (RM) の状態埋め込み (z) をエージェントに提供します。
+- Agentのチェックポイントは `state_dict` 形式を想定しています。
 """
 
 import os
@@ -19,7 +19,7 @@ import torch.nn as nn
 
 import craftium
 
-# train.py と同じ補助クラスを最小再掲（依存を増やさない）
+# Helper Classes (Trainingスクリプトと同一の定義)
 import re
 import hashlib
 

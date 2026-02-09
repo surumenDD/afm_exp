@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-# ARM-FM + PPO for Craftium ChopTree (Hydra-aligned project structure)
+# ARM-FM + PPO for Craftium ChopTree (Hydra-based)
 #
 # 目的:
-# - experiments/exp__lstmppo と同様に Hydra の run.dir 配下へ成果物を集約する
-# - LLM を毎回呼ばないための fm_output_dir を追加する（既存成果物参照）
+# - `experiments/exp__lstmppo` と同様に Hydra の `run.dir` 配下へ成果物を集約する。
+# - LLM (FM) を毎回呼び出さないよう、`fm_output_dir` を導入して既存成果物を再利用可能にする。
 #
-# Hydra の chdir=true により、実行時の CWD は hydra.run.dir へ移動する。
+# Note: Hydra の `chdir=true` 設定により、実行時のカレントディレクトリは `hydra.run.dir` に移動します。
 
 import os
 import re
@@ -731,7 +731,7 @@ def make_env(cfg: DictConfig, idx: int, run_name: str, larm: Optional[LARM]):
             safe_prefix = str(run_name).replace("/", "__")
             env = gym.wrappers.RecordVideo(
                 env,
-                video_folder="videos",
+                # "/" が含まれるとディレクトリ階層として解釈されてエラーになるため、置換する
                 name_prefix=safe_prefix,
             )
         else:
@@ -1035,7 +1035,6 @@ def main(cfg: DictConfig):
                         -float(cfg.ppo.clip_coef),
                         float(cfg.ppo.clip_coef),
                     )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
                 else:
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
