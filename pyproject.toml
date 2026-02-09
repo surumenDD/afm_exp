@@ -1,0 +1,34 @@
+[project]
+name = "afm-exp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  # PyTorch (CUDA 12.6)
+  "torch==2.10.0+cu126",
+
+  # Core scientific / RL
+  "numpy==2.4.2",
+  "gymnasium==0.29.1",
+
+  # Configuration
+  "hydra-core==1.3.2",
+  "omegaconf==2.3.0",
+
+  # Networking / env
+  "requests",
+  "python-dotenv",
+
+  # Logging / visualization
+  "tensorboard==2.20.0",
+  "wandb==0.24.2",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
