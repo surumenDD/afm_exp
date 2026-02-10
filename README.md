@@ -8,9 +8,9 @@
 実験は以下の 4 種類を実施する。
 
 1. **PPO（ベースライン）**  
-   - armfmppo の CLI を用いるが、**armfmppo を無効（enable=False）**にして実行する。
+   - armfmppo の CLI を用いるが、**armfmppo を無効（armfm.enable=false）**にして実行する。
 2. **LSTM-PPO**
-3. **ARMFM-PPO（報酬密化モデル）**  
+3. **ARMFM-PPO（基盤モデルを用いた報酬密化モデル）**  
    - 参考: https://arxiv.org/abs/2510.14176
 4. **Dreamer-V3**
 
