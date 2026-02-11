@@ -38,7 +38,7 @@ $ python train.py   obs_size=64   num_envs=1   steps=4000000   action_repeat=1  
 $ python single_seed_dreamer_evaluate.py   --agent-path your-checkpoint-path   --num-episodes 5   --seed 77   --seed-num 1   --video-dir your-output-path   --mt-wd ./eval_runs   --mt-port 0   --prefer-ckpt-cfg
 ```
 
-## 🤔 各実験結果（5 episode）
+## 🔗 各実験結果（5 episode）
 - **ベースライン（PPO）**: Mean Reward:  26.80 ± 6.18,  Min/Max: 16.0 / 34.0, Mean Length:  7570 ± 861, Mean Chops:   26.8 ± 6.2
 - **LSTM**: Mean Return: 21.00 ± 12.88, Min/Max: 9.0 / 46.0, Mean Length: 7145 ± 1710, Mean Chops: 21.00 ± 12.88
 - **報酬密モデル（ARMFM-PPO）**: Mean Reward: 30.00 ± 13.46, Min/Max: 13.0 / 46.0 , Mean Length: 8000 ± 0, Mean Chops: 30.0 ± 13.5
