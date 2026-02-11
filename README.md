@@ -1,22 +1,22 @@
 # Craftium（Minecraft風環境）における ChopTree タスク実験まとめ
 
 ## タスク概要
-- Craftium による Minecraft 風環境で、**ChopTree（木を切る）**タスクを扱う。  
+- Craftium による Minecraft 風環境で、ChopTree（木を切る）タスクを扱う。  
   - 参考: https://craftium.readthedocs.io/en/latest/
 
 ## 実験設定
 実験は以下の 4 種類を実施する。
 
 1. **PPO（ベースライン）**  
-   - armfmppo の CLI を用いるが、**armfmppo を無効（armfm.enable=false）**にして実行する。
+   - armfmppo の CLI を用いるが、armfmppo を無効（`armfm.enable=false`）にして実行する。
 2. **LSTM-PPO**
 3. **ARMFM-PPO（基盤モデルを用いた報酬密化モデル）**  
    - 参考: https://arxiv.org/abs/2510.14176
 4. **Dreamer-V3**
 
 ## 実験の詳細資料
-- 実験の詳しい内容は、指定の Speaker Deck を参照する。
- - （後日）
+- 実験の詳しい内容は、下記スライドに を参照願う。
+ - https://docs.google.com/presentation/d/1YFPPANQHdqVDyWHWfhTbMwgxJZ7TmN-MGpwsTWlH6cE/edit?usp=drive_link
 
 ## 実験手順
 ### 1. Craftium 環境の構築
