@@ -2,7 +2,6 @@
 """
 Dreamer 学習済みエージェント評価（単発 seed / 複数 seed）
 - checkpoint 内の cfg（訓練時 Hydra cfg）を最優先で読み、同一形状の Dreamer を再構築してロードする
-- cfg が無い checkpoint でも「shape が合う重みだけロード」で例外を出さない
 - --stochastic を付けると eval 時に actor.sample() を使う（mode ではない）
 - LSTM-PPO eval と同じ体裁の "Evaluation Results" を per-seed / multi-seed で出力する
 """
